@@ -1,0 +1,1097 @@
+---
+title: "DESeq2_AxD_final"
+author: "Zuzana & Pavel"
+date: '230425'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages:
+```{r}
+library("DESeq2")
+library("pheatmap")
+library("RColorBrewer")
+library("AnnotationDbi")
+library("ggplot2")
+library("genefilter")
+library("scales")
+library("ggrepel")
+library("EnhancedVolcano")
+library("org.Hs.eg.db")
+library("xlsx")
+library("clusterProfiler")
+library("DOSE")
+organism <- org.Hs.eg.db
+library("enrichplot")
+library("ComplexHeatmap")
+library("gridExtra")
+library("ggVennDiagram")
+library("circlize")
+library("dplyr")
+
+NA_replace <- function(gene.df) {
+  for (s in 1:length(gene.df$symbol)){
+    if (is.na(gene.df[s,"symbol"])){
+      gene.df[s,"symbol"] <- rownames(gene.df)[s]
+    }
+  }
+  return(gene.df)
+}
+
+# Filter ORA results to remove redundant GO terms for visualization
+filterGO <- function(df){
+  # Filter data based on geneID and p.adjust columns
+  filtered_df <- df %>%
+  group_by(geneID) %>%
+  mutate(rank = dense_rank(p.adjust)) %>%
+  ungroup() %>%
+  filter(rank == 1) %>%
+  group_by(geneID, p.adjust) %>%
+  mutate(n = row_number()) %>%
+  ungroup() %>%
+  filter(n == 1 | p.adjust != lag(p.adjust)) %>%
+  group_by(geneID) %>%
+  slice_sample(n = 1) %>%
+  ungroup()
+  filtered_df <- filtered_df[order(filtered_df$p.adjust,decreasing = F),1:10]
+
+  # Find out which rows were filtered out
+  return(anti_join(df, filtered_df, by = c("ID", "geneID", "p.adjust"))$ID)
+}
+```
+
+```{r}
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+```
+
+# Aggrewell
+Experiment number 1: embryoid bodies grown in Aggrewells, samples collected at D3, D5, D7, and D9 in culture. Bulk RNAseq to compare AxD vs. CTRL at each time point.
+
+Read samples file, add suffix to SampleName corresponding to count files:
+```{r}
+setwd("Aggrewell")
+samples <- read.table("samples.csv",header=T,sep=",")
+samples$countf <- paste(samples$SampleName,"count",sep="_union_name.") 
+```
+
+Filtering of samples which will/will not go into DESeq analysis together, creating data file for DESeq. Omit 825 from analysis:
+```{r}
+samples <- samples[samples$Project == "AxD_organoids",]
+samples <- samples[samples$Cell_line == "UNC",]
+
+samplesDESeq             <- with(samples,data.frame(SampleName = I(SampleName), countf = I(countf)))
+samplesDESeq$Sample      <- as.factor(samples$SampleName)
+samplesDESeq$Project     <- as.factor(samples$Project)
+samplesDESeq$cell_line   <- as.factor(samples$Cell_line)
+samplesDESeq$Condition   <- factor(samples$Condition, levels = c("CTRL","AxD"))
+samplesDESeq$Round       <- factor(samples$Round, levels = c("R9","R15","R16","R17"))
+samplesDESeq$Timepoint   <- factor(samples$Timepoint, levels = c("d3","d5","d7","d9"))
+samplesDESeq$Replicate   <- as.factor(samples$Replicate)
+```
+
+Creates cds, object for DESeq analysis with second column specifying location of the count files. Shortens row names - ENSEMBLE ID to only first 18 characters. cds data filtered, so that genes with 0s in all samples are removed. Plot PCA (top 500 variable genes) from rlog data. dds will proceed to DESeq2 pipeline.
+```{r}
+cds <- DESeqDataSetFromHTSeqCount(samplesDESeq,directory="count/",design= ~ Condition) 
+
+keep <- rowSums(counts(cds)) >= 1
+dds <- cds[keep,]
+rld <- rlog(dds)
+
+saveRDS(rld,"rld.rds")
+#rld <- readRDS("rld.rds")
+
+saveRDS(dds,"dds.rds")
+#dds <- readRDS("dds.rds")
+
+data <- plotPCA(rld, intgroup = c("Condition","Timepoint"), returnData=TRUE,
+                ntop = 500)
+levels(data$Condition) <- c("R239R-Ctrl","R239C-AxD-1")
+percentVar <- round(100 * attr(data, "percentVar"))
+p <- qplot(PC1, PC2, color=Condition, shape=Timepoint, data=data) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("R239R-Ctrl" = "#5a9ac6", "R239C-AxD-1" = "#fa5340")) +
+  scale_shape_manual(values = c(15,16,17,8)) +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(linewidth = 0.7, color = "grey"),
+        axis.ticks = element_line(linewidth = 1, color = "grey"),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12),
+        legend.key.size = unit(0.7,units = "cm"), 
+        legend.spacing = unit(0,units = "cm")) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  guides(shape = guide_legend(title = "Time Point"), 
+         color = guide_legend(title = "Condition", order = 2))
+p
+
+#ggsave("PCA.png", plot = p, device = "png", bg = "white", width = 5, height = 4)
+ggsave("PCA.svg", plot = p, device = "svg", bg = "white", width = 6, height = 4)
+```
+
+Expression plot of development-related genes:
+```{r}
+goi <- c("POU5F1","NANOG","PAX6","OTX1","HAND2","SOX17","AJAP1","MT1F")
+goi.ensembl <- mapIds(org.Hs.eg.db,keys=goi,column="ENSEMBL",keytype="SYMBOL",multiVals="first")
+
+plot.list <- list()
+for (gene in 1:length(goi)){
+  data <- plotCounts(dds, gene=goi.ensembl[gene], intgroup=c("Condition","Timepoint","Replicate"), returnData=TRUE)
+  
+  df.means <- data.frame(condition = rep(c("CTRL","AxD"),4),
+                         timepoint = rep(c("d3","d5","d7","d9"),each = 2),
+                         mean = c(mean(data[data$Condition == "CTRL" & data$Timepoint == "d3","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "d3","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "d5","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "d5","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "d7","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "d7","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "d9","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "d9","count"])),
+                         sd = c(sd(data[data$Condition == "CTRL" & data$Timepoint == "d3","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "d3","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "d5","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "d5","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "d7","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "d7","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "d9","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "d9","count"])))
+  df.means$ymax <- df.means$mean + df.means$sd
+  df.means$ymin <- df.means$mean - df.means$sd
+  
+  df.means$condition <- factor(df.means$condition, levels=c("CTRL","AxD"))  
+  plot.list[[gene]] <- df.means
+}
+names(plot.list) <- goi
+
+line_plot <- function(df.means, title){
+  p <- ggplot(df.means, aes(x=timepoint, y=mean, group=condition,color=condition,fill=condition)) +
+    #geom_point(size=3) +
+    geom_line(linewidth=2) +
+    #scale_fill_discrete(breaks = c("CTRL","AxD")) +
+    scale_fill_manual(values = c("CTRL" = "#5a9ac6", "AxD" = "#fa5340")) +
+    geom_ribbon(aes(ymax=ymax, ymin=ymin, fill = condition), alpha=0.1) +
+    #geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), width=0.1) +
+    ggtitle(title) + xlab("Time Point") + ylab("Mean Normalized Counts") + 
+    #labs(caption = "error bars = SD") +
+    scale_color_manual(values=c("#5a9ac6","#fa5340")) +
+    theme_classic() +
+    theme(axis.title = element_text(size = 14),
+          axis.text = element_text(size = 16),
+          axis.line = element_line(linewidth = 0.7),
+          axis.ticks = element_line(linewidth = 1.5),
+          plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+          legend.position = "none") +
+    guides(color = guide_legend(title = "Condition"))
+  return(p)
+}
+
+plot.list <- lapply(seq_along(plot.list), function(x) line_plot(plot.list[[x]], names(plot.list)[x])) 
+names(plot.list) <- goi
+lapply(seq_along(plot.list), function(x) ggsave(paste0("count_plots/count_",names(plot.list)[x],".svg"), plot=plot.list[[x]], device = "svg", width = 3,height = 3))  
+
+ggsave("count_plots/counts.svg",plot = gridExtra::grid.arrange(grobs=plot.list), device = "svg", width = 10, height = 10)
+```
+
+DESeq, Filter up and downregulated genes - no NAs in fold change and padj, also baseMean higher than 10. When no gene symbol was mapped, copy ENSEMBL to symbol column.:
+```{r}
+timepoints <- c("d3","d5","d7","d9")
+
+for (tp in timepoints){
+  dds.tp <- dds[,dds$Timepoint %in% tp]
+  dds.tp$Condition <- as.factor(as.vector(dds.tp$Condition))
+  design(dds.tp) <- ~ Condition
+  dds.tp.DESeq <- DESeq(dds.tp) 
+  
+  saveRDS(dds.tp.DESeq,paste0("dds_",tp,".rds"))
+  
+  res <- results(dds.tp.DESeq,contrast=c("Condition","AxD","CTRL"))
+  res$symbol <- mapIds(org.Hs.eg.db,keys=row.names(res),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+  
+  saveRDS(res, paste0("res_",tp,".rds"))
+  write.csv(res,file = paste0("unfiltered_",tp,".csv"))
+  
+  markers <- res[!is.na(res$log2FoldChange),]
+  markers <- markers[!is.na(markers$padj),]
+  markers <- markers[markers$baseMean >= 10,]
+  markers[order(markers$padj),]
+  genes <- as.data.frame(markers)
+  genes <- NA_replace(genes)
+    
+  saveRDS(genes, paste0("filtered_",tp,".rds"))
+  write.csv(genes, paste0("filtered_",tp,".csv"))
+}
+```
+
+Barplot of DEGs, padj < 0.05, abs(log2FC) > 1 + numbers of DEGs at each time point into table:
+```{r}
+padj <- 0.05
+# summarize numbers of DEGs, including shared ones, into a dataframe
+df.numbers <- data.frame(UNC_up = c(),UNC_down = c())
+counts <- c()
+for (tp in timepoints) {
+  DEGs.UNC <- readRDS(paste0("filtered_",tp,".rds"))
+
+  up.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange > 1 & DEGs.UNC$padj < padj,])
+  down.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange < -1 & DEGs.UNC$padj < padj,])
+  
+  df.numbers <- rbind(df.numbers, c(length(up.UNC), length(down.UNC)))
+  counts <- append(counts, c(length(up.UNC), length(down.UNC)))
+}
+  
+colnames(df.numbers) <- c("UNC_up", "UNC_down")
+rownames(df.numbers) <- timepoints
+df.numbers
+
+# create barplot of DEGs
+df <- data.frame(timepoints = rep(c("d3","d5","d7","d9"), each = 2),
+                   counts = counts, 
+                   set = rep(c("upregulated","downregulated"), times = 4))
+df$set <- factor(df$set, levels = c("upregulated", "downregulated"))
+  
+p <- ggplot(data=df, aes(x=timepoints, y=counts, fill=set)) + 
+     geom_bar(stat="identity", position=position_dodge(), width = 0.8) + 
+     theme(axis.text.x = element_text(size = 7)) + 
+     labs(x = "Time Points", fill = "Regulation", y = "Number of DEGs") + 
+     scale_fill_manual(values=c("#fa5340", "#5a9ac6")) + 
+     scale_y_continuous(expand = c(0, 0), limits = c(0, 1.1*max(df$counts))) +  
+     theme_classic()  + 
+     theme(axis.title = element_text(size=24), plot.title = element_text(size = 18, face = "bold"), 
+           legend.title = element_blank(), axis.line = element_line(colour = 'black', size = 0.5), 
+           axis.ticks.x = element_line(colour = "black", size = 3), axis.text.x = element_text(size = 24), 
+           axis.text.y = element_text(size = 24), legend.text = element_text(size = 20, vjust = 0.7),
+           legend.position = "bottom") + 
+     geom_text(aes(y=counts, label=counts), position = position_dodge(0.85), vjust=-0.5, color="black", size=7) 
+p  
+#ggsave(filename = "barplotDEGs.png", plot = p, device = "png", height = 8, width = 8)
+ggsave(filename = "barplotDEGs_new.svg", plot = p, device = "svg", height = 8, width = 8)
+```
+
+ORA
+Results are pooled - mixed BP, CC, MF, ordered by p.adj. Visualized are 5 top terms for each time point.
+```{r}
+timepoints <- c("d3","d5","d7","d9")
+setup <- c("UP","DOWN")
+background.file <- readRDS("dds.rds")
+background <- rownames(background.file)
+
+for (tp in timepoints){
+  GOresults <- list()
+  gene.list.file <- readRDS(paste0("filtered_",tp,".rds"))
+  gene.list <- gene.list.file[gene.list.file$padj < 0.05,]
+  for (s in setup){
+    if (s == "UP"){
+      genes <- rownames(gene.list[gene.list$log2FoldChange > 1,])  
+    } else if (s == "DOWN"){
+      genes <- rownames(gene.list[gene.list$log2FoldChange < -1,])  
+    }
+
+    ego <- enrichGO(gene  = genes,
+            universe      = background,
+            keyType       = "ENSEMBL",
+            OrgDb         = org.Hs.eg.db,
+            ont           = "ALL", 
+            pAdjustMethod = "fdr",
+            pvalueCutoff  = 0.1,
+            qvalueCutoff  = 0.2,
+            readable      = TRUE,
+            minGSSize     = 3)
+
+    ego <- simplify(ego)
+    ego@result <- ego@result[order(ego@result$p.adjust),]
+    GOresults <- append(GOresults, ego)
+  }
+
+  names(GOresults) <- setup
+
+  save(GOresults,file = paste0("ORA/ORA_",tp,".RData"))
+    
+  # Create xlsx files of results.
+  file <- paste0("ORA/ORA_",tp,".xlsx")
+  write.xlsx("empty", file, sheetName = "0", append = FALSE)
+  for (n in 1:length(GOresults)){
+    if (dim(GOresults[[n]])[1] != 0) {
+      write.xlsx(GOresults[[n]], file, sheetName = setup[n], append = TRUE)
+    }
+  }
+}
+
+# merge results for time points in UP/DOWN and show emaplot
+for (tp in timepoints){
+  load(paste0("ORA/ORA_",tp,".RData"))
+  assign(tp, GOresults)
+}
+
+for (s in setup){
+  GO.list <- list(d3[[s]], d5[[s]], d7[[s]], d9[[s]])
+  names(GO.list) <- timepoints
+  #GO.list <- lapply(GO.list, function(x) dropGO(x, term=filterGO(x@result)))
+  merged.GO <- merge_result(GO.list)
+  merged.GO.plot <- pairwise_termsim(merged.GO)
+  merged.GO.plot@compareClusterResult <- merged.GO.plot@compareClusterResult[merged.GO.plot@compareClusterResult$Count > 3,]
+  q <- dotplot(merged.GO.plot, by = "GeneRatio", showCategory = 3, includeAll = T, label_format = 50, split = "ONTOLOGY") +
+    theme_light() +
+    facet_grid(ONTOLOGY~., scales = "free", space = "free_y") +
+    theme(axis.text = element_text(size = 16, colour = "black"),
+          axis.text.x = element_text(face = "bold"),
+          axis.title.x = element_blank(),
+          plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          legend.text = element_text(size = 14),
+          legend.title = element_text(size = 14),
+          strip.text.y = element_text(size = 14, face = "bold", colour = "black"),
+          strip.background = element_rect(colour = "#b3b3b3", fill="#b3b3b3", linetype = "solid", linewidth = 3)) +
+    scale_x_discrete(labels = timepoints)
+  if (s == "UP"){
+    q1 <- q + scale_color_gradient(low = "#fa5340", high = "#fef2f0") + ggtitle("Upregulated GO Terms") 
+    #terms.UP <- unique(q1[["data"]][,"ID"])
+    #ggsave(paste0("ORA/dotplot_",s,".svg"), plot = q1, device = "svg", width = 9, height = 7, bg = "white")
+  } else {
+    q2 <- q + scale_color_gradient(low = "#5a9ac6", high = "#f2f7fa") + ggtitle("Downregulated GO Terms")
+    #terms.DOWN <- unique(q2[["data"]][,"ID"])
+    #ggsave(paste0("ORA/dotplot_",s,".svg"), plot = q2, device = "svg",width = 8.5, height = 6, bg = "white")
+  }
+}
+
+ggsave("ORA/dotplots_new2.svg", plot = q1 | q2, device = "svg", width = 17, height = 12)
+```
+
+Heatmap: genes selected based on ORA results, top 10 based on log2FC for each time point.Genes are ordered based on +- time point.
+```{r}
+rld <- readRDS("rld.rds")
+timepoints <- c("d3","d5","d7","d9")
+list.UP <- unique(as.character(unlist(read.csv("ORA/heatmap_genes_UP.csv"))))
+list.DOWN <- unique(as.character(unlist(read.csv("ORA/heatmap_genes_DOWN.csv"))))
+genes.top20 <- c()
+for (tp in timepoints){
+  file <- readRDS(paste0("filtered_",tp,".rds"))
+  
+  DEGs.UP <- file[which(file$symbol %in% list.UP),]
+  DEGs.DOWN <- file[which(file$symbol %in% list.DOWN),]
+  
+  DEGs.UP <- rownames(head(DEGs.UP[order(DEGs.UP$log2FoldChange, decreasing = T),],10))
+  DEGs.DOWN <- rownames(head(DEGs.DOWN[order(DEGs.DOWN$log2FoldChange, decreasing = F),],10))
+  
+  genes.top20 <- append(genes.top20, c(DEGs.UP,DEGs.DOWN))
+}
+
+genes.top20 <- unique(genes.top20)
+
+mat <- assay(rld)
+mat <- mat - rowMeans(mat)
+mat2 <- mat[genes.top20,]
+symbols <- mapIds(org.Hs.eg.db,keys=rownames(mat2),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+symbols[which(is.na(symbols))] <- names(symbols[which(is.na(symbols))])
+new.names <- as.character(symbols)
+rownames(mat2) <- new.names
+
+df.means <- data.frame(genes = rownames(mat2),
+                       `R239R-Ctrl_d3` = rowMeans(mat2[,c("UNC-CR-R9-d3","UNC-CR-R15-d3","UNC-CR-R16-d3","UNC-CR-R17-d3")]),
+                       `R239C-AxD-1_d3` = rowMeans(mat2[,c("UNC-R9-d3","UNC-R15-d3","UNC-R16-d3","UNC-R17-d3")]),
+                       `R239R-Ctrl_d5` = rowMeans(mat2[,c("UNC-CR-R9-d5","UNC-CR-R15-d5","UNC-CR-R16-d5","UNC-CR-R17-d5")]),
+                       `R239C-AxD-1_d5` = rowMeans(mat2[,c("UNC-R9-d5","UNC-R15-d5","UNC-R16-d5","UNC-R17-d5")]),
+                       `R239R-Ctrl_d7` = rowMeans(mat2[,c("UNC-CR-R9-d7","UNC-CR-R15-d7","UNC-CR-R16-d7","UNC-CR-R17-d7")]),
+                       `R239C-AxD-1_d7` = rowMeans(mat2[,c("UNC-R9-d7","UNC-R15-d7","UNC-R16-d7","UNC-R17-d7")]),
+                       `R239R-Ctrl_d9` = rowMeans(mat2[,c("UNC-CR-R9-d9","UNC-CR-R15-d9","UNC-CR-R16-d9","UNC-CR-R17-d9")]),
+                       `R239C-AxD-1_d9` = rowMeans(mat2[,c("UNC-R9-d9","UNC-R15-d9","UNC-R16-d9","UNC-R17-d9")]))   
+df.means <- df.means[,-1]
+mat3 <- as.matrix(df.means)
+saveRDS(mat3,"means_matrix.rds")
+write.csv(mat3, "means_matrix.csv")
+
+mat3 <- readRDS("means_matrix.rds")
+pdf("heatmap_Aggrewell_new.pdf",width=8,height=14)
+#svg("heatmap.svg",width=6,height=13.5)
+#png("heatmap.png",width=6,height=13.5,units = "in",res = 300)
+draw(Heatmap(mat3, col = colorRamp2(c(-4,-2,0,2,4),c("#3e6b8a","#5a9ac6","white","#fa5340","#af3a2c")),
+        row_title = " ", column_title = " ", column_names_rot = 90,
+        show_column_dend = F, show_row_dend = F, show_column_names = T, show_row_names = T,
+        row_names_gp = gpar(fontsize = 16),
+        column_names_gp = gpar(fontsize = 18),
+        cluster_columns = F,         
+        cluster_rows = T,
+        cluster_column_slices = F,
+        column_split = factor(rep(c("1","2"),4), levels = c("1","2")),
+        row_km = 2,
+        heatmap_legend_param = list(title = expression("Log"[2]*"FC scale"),at = c(-4,-2,0,2,4), 
+                                    direction = "horizontal", title_gp = gpar(fontsize = 16),
+                                    labels_gp = gpar(fontsize = 16), legend_width = unit(6,"cm"),
+                                    title_position = "topcenter")),
+     heatmap_legend_side = "top")
+dev.off()
+```
+
+# Lancaster
+Data from experiment number 2, only direct-seeding approach (Lancaster). Organoids harvested at D3, D5, D7, and D9, compare AxD vs. CTRL at each time point.
+
+Read samples file, add suffix to SampleName corresponding to count files:
+```{r}
+setwd("Lancaster")
+samples <- read.table("samples.csv",header=T,sep=",")
+samples$countf <- paste(samples$SampleName,"count",sep="_union_name.") 
+```
+
+Filtering of samples which will/will not go into DESeq analysis together, creating data file for DESeq. :
+```{r}
+samples <- samples[samples$Project == "AW_vs_LC",]
+samples <- samples[samples$Cultivation == "Lancaster",]
+
+samplesDESeq             <- with(samples,data.frame(SampleName = I(SampleName), countf = I(countf)))
+samplesDESeq$Sample      <- as.factor(samples$SampleName)
+samplesDESeq$Project     <- as.factor(samples$Project)
+samplesDESeq$cell_line   <- as.factor(samples$Cell_line)
+samplesDESeq$Condition   <- factor(samples$Condition, levels = c("CTRL","AxD"))
+samplesDESeq$Round       <- factor(samples$Round, levels = c("R22","R23","R24","R25","R26"))
+samplesDESeq$Timepoint   <- factor(samples$Timepoint, levels = c("D3","D5","D7","D9"))
+samplesDESeq$Replicate   <- as.factor(samples$Replicate)
+```
+
+Creates cds, object for DESeq analysis with second column specifying location of the count files. Shortens row names - ENSEMBLE ID to only first 18 characters. cds data filtered, so that genes with 0s in all samples are removed. Plot PCA (top 500 variable genes) from rlog data. dds will proceed to DESeq2 pipeline.
+```{r}
+cds <- DESeqDataSetFromHTSeqCount(samplesDESeq,directory="count/",design= ~ Condition) 
+
+keep <- rowSums(counts(cds)) >= 1
+dds <- cds[keep,]
+rld <- rlog(dds)
+
+saveRDS(rld,"rld.rds")
+#rld <- readRDS("rld.rds")
+
+saveRDS(dds,"dds.rds")
+#dds <- readRDS("dds.rds")
+
+data <- plotPCA(rld, intgroup = c("Condition","Timepoint"), returnData=TRUE,
+                ntop = 500)
+levels(data$Condition) <- c("R239R-Ctrl","R239C-AxD-1")
+
+percentVar <- round(100 * attr(data, "percentVar"))
+p <- qplot(PC1, PC2, color=Condition, shape=Timepoint, data=data) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("R239R-Ctrl" = "#5a9ac6", "R239C-AxD-1" = "#fa5340")) +
+  scale_shape_manual(values = c(15,16,17,8), labels=c("d3","d5","d7","d9")) +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(linewidth = 0.7, color = "grey"),
+        axis.ticks = element_line(linewidth = 1, color = "grey"),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12),
+        legend.key.size = unit(0.7,units = "cm"), 
+        legend.spacing = unit(0,units = "cm")) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  guides(shape = guide_legend(title = "Time Point"), 
+         color = guide_legend(title = "Condition", order = 2))
+p
+
+ggsave("PCA.png", plot = p, device = "png", bg = "white", width = 5, height = 4)
+ggsave("PCA_Lancaster_new.svg", plot = p, device = "svg", bg = "white", width = 6, height = 4)
+```
+
+Expression plot of development-related genes:
+```{r}
+goi <- c("POU5F1","NANOG","PAX6","OTX1","HAND2","SOX17","AJAP1","MT1F")
+goi.ensembl <- mapIds(org.Hs.eg.db,keys=goi,column="ENSEMBL",keytype="SYMBOL",multiVals="first")
+
+plot.list <- list()
+for (gene in 1:length(goi)){
+  data <- plotCounts(dds, gene=goi.ensembl[gene], intgroup=c("Condition","Timepoint","Replicate"), returnData=TRUE)
+  
+  df.means <- data.frame(condition = rep(c("CTRL","AxD"),4),
+                         timepoint = rep(c("d3","d5","d7","d9"),each = 2),
+                         mean = c(mean(data[data$Condition == "CTRL" & data$Timepoint == "D3","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "D3","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "D5","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "D5","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "D7","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "D7","count"]),
+                                  mean(data[data$Condition == "CTRL" & data$Timepoint == "D9","count"]),
+                                  mean(data[data$Condition == "AxD" & data$Timepoint == "D9","count"])),
+                         sd = c(sd(data[data$Condition == "CTRL" & data$Timepoint == "D3","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "D3","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "D5","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "D5","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "D7","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "D7","count"]),
+                                  sd(data[data$Condition == "CTRL" & data$Timepoint == "D9","count"]),
+                                  sd(data[data$Condition == "AxD" & data$Timepoint == "D9","count"])))
+  df.means$ymax <- df.means$mean + df.means$sd
+  df.means$ymin <- df.means$mean - df.means$sd
+  
+  df.means$condition <- factor(df.means$condition, levels=c("CTRL","AxD"))
+  plot.list[[gene]] <- df.means
+}
+names(plot.list) <- goi
+
+line_plot <- function(df.means, title){
+  p <- ggplot(df.means, aes(x=timepoint, y=mean, group=condition,color=condition,fill=condition)) +
+    #geom_point(size=3) +
+    geom_line(size=2) +
+    #scale_fill_discrete(breaks = c("CTRL","AxD")) +
+    scale_fill_manual(values = c("CTRL" = "#5a9ac6", "AxD" = "#fa5340")) +
+    geom_ribbon(aes(ymax=ymax, ymin=ymin, fill = condition), alpha=0.1) +
+    #geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), width=0.1) +
+    ggtitle(title) + xlab("Time Point") + ylab("Mean Normalized Counts") + 
+    #labs(caption = "error bars = SD") +
+    scale_color_manual(values=c("#5a9ac6","#fa5340")) +
+    theme_classic() +
+    theme(axis.title = element_text(size = 14),
+          axis.text = element_text(size = 16),
+          axis.line = element_line(linewidth = 0.7),
+          axis.ticks = element_line(linewidth = 1.5),
+          plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+          legend.position = "none") +
+    guides(color = guide_legend(title = "Condition"))
+  return(p)
+}  
+
+plot.list <- lapply(seq_along(plot.list), function(x) line_plot(plot.list[[x]], names(plot.list)[x]))  
+lapply(seq_along(plot.list), function(x) ggsave(paste0("count_plots/count_",names(plot.list)[x],".svg"), plot=plot.list[[x]], device = "svg", width = 3,height = 3))  
+
+ggsave("count_plots/counts.svg",plot = gridExtra::grid.arrange(grobs=plot.list), device = "svg", width = 10, height = 10)
+```
+
+DESeq, Filter up and downregulated genes - no NAs in fold change and padj, also baseMean higher than 10. When no gene symbol was mapped, copy ENSEMBL to symbol column.:
+```{r}
+timepoints <- c("D3","D5","D7","D9")
+
+for (tp in timepoints){
+  dds.tp <- dds[,dds$Timepoint %in% tp]
+  dds.tp$Condition <- as.factor(as.vector(dds.tp$Condition))
+  design(dds.tp) <- ~ Condition
+  dds.tp.DESeq <- DESeq(dds.tp) 
+  
+  saveRDS(dds.tp.DESeq,paste0("dds_",tp,".rds"))
+  
+  res <- results(dds.tp.DESeq,contrast=c("Condition","AxD","CTRL"))
+  res$symbol <- mapIds(org.Hs.eg.db,keys=row.names(res),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+  
+  saveRDS(res, paste0("res_",tp,".rds"))
+  write.csv(res,file = paste0("unfiltered_",tp,".csv"))
+  
+  markers <- res[!is.na(res$log2FoldChange),]
+  markers <- markers[!is.na(markers$padj),]
+  markers <- markers[markers$baseMean >= 10,]
+  markers[order(markers$padj),]
+  genes <- as.data.frame(markers)
+  genes <- NA_replace(genes)
+    
+  saveRDS(genes, paste0("filtered_",tp,".rds"))
+  write.csv(genes, paste0("filtered_",tp,".csv"))
+}
+```
+
+Barplot of DEGs, padj < 0.05, abs(log2FC) > 1 + numbers of DEGs at each time point into table:
+```{r}
+padj <- 0.05
+# summarize numbers of DEGs, including shared ones, into a dataframe
+df.numbers <- data.frame(UNC_up = c(),UNC_down = c())
+counts <- c()
+for (tp in timepoints) {
+  DEGs.UNC <- readRDS(paste0("filtered_",tp,".rds"))
+
+  up.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange > 1 & DEGs.UNC$padj < padj,])
+  down.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange < -1 & DEGs.UNC$padj < padj,])
+  
+  df.numbers <- rbind(df.numbers, c(length(up.UNC), length(down.UNC)))
+  counts <- append(counts, c(length(up.UNC), length(down.UNC)))
+}
+  
+colnames(df.numbers) <- c("UNC_up", "UNC_down")
+rownames(df.numbers) <- timepoints
+df.numbers
+
+# create barplot of DEGs
+df <- data.frame(timepoints = rep(c("d3","d5","d7","d9"), each = 2),
+                   counts = counts, 
+                   set = rep(c("upregulated","downregulated"), times = 4))
+df$set <- factor(df$set, levels = c("upregulated", "downregulated"))
+  
+p <- ggplot(data=df, aes(x=timepoints, y=counts, fill=set)) + 
+     geom_bar(stat="identity", position=position_dodge(), width = 0.8) + 
+     theme(axis.text.x = element_text(size = 7)) + 
+     labs(x = "Time Points", fill = "Regulation", y = "Number of DEGs") +
+     scale_fill_manual(values=c("#fa5340", "#5a9ac6")) +
+     scale_y_continuous(expand = c(0, 0), limits = c(0, 1.1*max(df$counts))) +  
+     theme_classic()  + 
+     theme(axis.title = element_text(size=24), plot.title = element_text(size = 18, face = "bold"), 
+           legend.title = element_blank(), axis.line = element_line(colour = 'black', size = 0.5), 
+           axis.ticks.x = element_line(colour = "black", size = 3), axis.text.x = element_text(size = 24), 
+           axis.text.y = element_text(size = 24), legend.text = element_text(size = 20, vjust = 0.7),
+           legend.position = "bottom") + 
+     geom_text(aes(y=counts, label=counts), position = position_dodge(0.85), vjust=-0.5, color="black", size=7) 
+p  
+#ggsave(filename = "barplotDEGs.png", plot = p, device = "png", height = 9, width = 8)
+ggsave(filename = "barplotDEGs_new.svg", plot = p, device = "svg", height = 9, width = 8)
+```
+
+ORA
+Results are pooled - mixed BP, CC, MF, ordered by p.adj. Visualized are 5 top terms for each time point.
+```{r}
+timepoints <- c("d3","d5","d7","d9")
+setup <- c("UP","DOWN")
+background.file <- readRDS("dds.rds")
+background <- rownames(background.file)
+
+for (tp in timepoints){
+  GOresults <- list()
+  gene.list.file <- readRDS(paste0("filtered_",tp,".rds"))
+  gene.list <- gene.list.file[gene.list.file$padj < 0.05,]
+  for (s in setup){
+    if (s == "UP"){
+      genes <- rownames(gene.list[gene.list$log2FoldChange > 1,])  
+    } else if (s == "DOWN"){
+      genes <- rownames(gene.list[gene.list$log2FoldChange < -1,])  
+    }
+
+    ego <- enrichGO(gene  = genes,
+            universe      = background,
+            keyType       = "ENSEMBL",
+            OrgDb         = org.Hs.eg.db,
+            ont           = "ALL", 
+            pAdjustMethod = "fdr",
+            pvalueCutoff  = 0.1,
+            qvalueCutoff  = 0.2,
+            readable      = TRUE,
+            minGSSize     = 3)
+
+    ego <- simplify(ego)
+    ego@result <- ego@result[order(ego@result$p.adjust),]
+    GOresults <- append(GOresults, ego)
+  }
+
+  names(GOresults) <- setup
+
+  save(GOresults,file = paste0("ORA/ORA_",tp,".RData"))
+    
+  # Create xlsx files of results.
+  file <- paste0("ORA/ORA_",tp,".xlsx")
+  write.xlsx("empty", file, sheetName = "0", append = FALSE)
+  for (n in 1:length(GOresults)){
+    if (dim(GOresults[[n]])[1] != 0) {
+      write.xlsx(GOresults[[n]], file, sheetName = setup[n], append = TRUE)
+    }
+  }
+}
+
+# merge results for time points in UP/DOWN 
+for (tp in timepoints){
+  load(paste0("ORA/ORA_",tp,".RData"))
+  assign(tp, GOresults)
+}
+
+for (s in setup){
+  GO.list <- list(d3[[s]], d5[[s]], d7[[s]], d9[[s]])
+  names(GO.list) <- timepoints
+  
+ # GO.list <- lapply(seq_along(GO.list), function(x) {filter(GO.list[[x]]@result, ONTOLOGY == o) })
+  
+ # GO.list <- lapply(GO.list, function(x) dropGO(x, term=filterGO(x@result)))
+  merged.GO <- merge_result(GO.list)
+  merged.GO.plot <- pairwise_termsim(merged.GO)
+  merged.GO.plot@compareClusterResult <- merged.GO.plot@compareClusterResult[merged.GO.plot@compareClusterResult$Count > 3,]
+  q <- dotplot(merged.GO.plot, by = "GeneRatio", showCategory = 3, includeAll = T, label_format = 50, split = "ONTOLOGY") +
+      theme_light() +
+      facet_grid(ONTOLOGY~., scales = "free", space = "free_y") +
+      theme(axis.text = element_text(size = 16, colour = "black"),
+            axis.text.x = element_text(face = "bold"),
+            axis.title.x = element_blank(),
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+            legend.text = element_text(size = 14),
+            legend.title = element_text(size = 14),
+            strip.text.y = element_text(size = 14, face = "bold", colour = "black"),
+            strip.background = element_rect(colour = "#b3b3b3", fill="#b3b3b3", linetype = "solid", linewidth = 3)) +
+      scale_x_discrete(labels = timepoints)
+    
+  if (s == "UP"){
+    q1 <- q + scale_color_gradient(low = "#fa5340", high = "#fef2f0") + ggtitle("Upregulated GO Terms") 
+    #terms.UP <- unique(q1[["data"]][,"ID"])
+    #ggsave(paste0("ORA/dotplot_",s,".png"), plot = q1, device = "png", width = 9.5, height = 7, bg = "white")
+    #ggsave(paste0("ORA/dotplot_",s,".svg"), plot = q1, device = "svg", width = 9.5, height = 10, bg = "white")
+  } else {
+    q2 <- q + scale_color_gradient(low = "#5a9ac6", high = "#f2f7fa") + ggtitle("Downregulated GO Terms")
+    #terms.DOWN <- unique(q2[["data"]][,"ID"])
+    #ggsave(paste0("ORA/dotplot_",s,".png"), plot = q2, device = "png",width = 6.5, height = 5, bg = "white")
+    #ggsave(paste0("ORA/dotplot_",s,".svg"), plot = q2, device = "svg",width = 9.5, height = 10, bg = "white")
+  }
+}
+
+ggsave("ORA/dotplots_new2.svg", plot = q1 | q2, device = "svg", width = 17, height = 12)
+```
+
+Heatmap: genes selected based on ORA results, top 10 based on log2FC for each time point.Genes are ordered based on +- time point.
+```{r}
+rld <- readRDS("rld.rds")
+timepoints <- c("D3","D5","D7","D9")
+list.UP <- unique(as.character(unlist(read.csv("ORA/heatmap_genes_UP.csv"))))
+list.DOWN <- unique(as.character(unlist(read.csv("ORA/heatmap_genes_DOWN.csv"))))
+genes.top20 <- c()
+for (tp in timepoints){
+  file <- readRDS(paste0("filtered_",tp,".rds"))
+  
+  DEGs.UP <- file[which(file$symbol %in% list.UP),]
+  DEGs.DOWN <- file[which(file$symbol %in% list.DOWN),]
+  
+  DEGs.UP <- rownames(head(DEGs.UP[order(DEGs.UP$log2FoldChange, decreasing = T),],10))
+  DEGs.DOWN <- rownames(head(DEGs.DOWN[order(DEGs.DOWN$log2FoldChange, decreasing = F),],10))
+  
+  genes.top20 <- append(genes.top20, c(DEGs.UP,DEGs.DOWN))
+}
+
+genes.top20 <- unique(genes.top20)
+
+mat <- assay(rld)
+mat <- mat - rowMeans(mat)
+mat2 <- mat[genes.top20,]
+symbols <- mapIds(org.Hs.eg.db,keys=rownames(mat2),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+symbols[which(is.na(symbols))] <- names(symbols[which(is.na(symbols))])
+new.names <- as.character(symbols)
+rownames(mat2) <- new.names
+
+df.means <- data.frame(genes = rownames(mat2),
+                       `R239R-Ctrl_d3` = rowMeans(mat2[,c("R22-CR-LC-d3","R26-CR-LC-d3")]),
+                       `R239C-AxD-1_d3` = rowMeans(mat2[,c("R22-LC-d3","R25-LC-d3","R26-LC-d3")]),
+                       `R239R-Ctrl_d5` = rowMeans(mat2[,c("R22-CR-LC-d5","R23-CR-LC-d5","R24-CR-LC-d5")]),
+                       `R239C-AxD-1_d5` = rowMeans(mat2[,c("R22-LC-d5","R23-LC-d5","R24-LC-d5")]),
+                       `R239R-Ctrl_d7` = rowMeans(mat2[,c("R22-CR-LC-d7","R23-CR-LC-d7","R24-CR-LC-d7")]),
+                       `R239C-AxD-1_d7` = rowMeans(mat2[,c("R22-LC-d7","R23-LC-d7","R24-LC-d7")]),
+                       `R239R-Ctrl_d9` = rowMeans(mat2[,c("R22-CR-LC-d9","R23-CR-LC-d9","R24-CR-LC-d9")]),
+                       `R239C-AxD-1_d9` = rowMeans(mat2[,c("R22-LC-d9","R23-LC-d9","R24-LC-d9")]))   
+
+df.means <- df.means[,-1]
+mat3 <- as.matrix(df.means)
+saveRDS(mat3,"means_matrix.rds")
+write.csv(mat3, "means_matrix.csv")
+
+mat3 <- readRDS("means_matrix.rds")
+pdf("heatmap_Lancaster_new.pdf",width = 8,height = 14)
+#svg("heatmap.svg",width=6,height=13.5)
+#png("heatmap.png",width=6,height=13.5,units = "in",res = 300)
+set.seed(123)
+draw(Heatmap(mat3, col = colorRamp2(c(-4,-2,0,2,4),c("#3e6b8a","#5a9ac6","white","#fa5340","#af3a2c")),
+        row_title = " ", column_title = " ", column_names_rot = 90,
+        show_column_dend = F, show_row_dend = F, show_column_names = T, show_row_names = T,
+        row_names_gp = gpar(fontsize = 16),
+        column_names_gp = gpar(fontsize = 18),
+        cluster_columns = F,         
+        cluster_rows = T,
+        cluster_column_slices = F,
+        column_split = factor(rep(c("1","2"),4), levels = c("1","2")),
+        row_km = 2,
+        heatmap_legend_param = list(title = expression("Log"[2]*"FC scale"),at = c(-4,-2,0,2,4), 
+                                    direction = "horizontal", title_gp = gpar(fontsize = 16),
+                                    labels_gp = gpar(fontsize = 16), legend_width = unit(6,"cm"),
+                                    title_position = "topcenter")),
+     heatmap_legend_side = "top")
+dev.off()
+```
+
+# Lancaster x Aggrewell round II
+Aggrewell data round II were generated at the same time in one experiment with Lancaster (direct-seeding) to be comparable. Here, we look into the differences between AW and direct-seeding at each time point in each condition (AxD, CTRL).
+
+Read samples file, add suffix to SampleName corresponding to count files:
+```{r}
+setwd("Lancaster-Aggrewell")
+samples <- read.table("samples.csv",header=T,sep=",")
+samples$countf <- paste(samples$SampleName,"count",sep="_union_name.") 
+```
+
+Filtering of samples which will/will not go into DESeq analysis together, creating data file for DESeq. :
+```{r}
+samples <- samples[samples$Project == "AW_vs_LC",]
+
+samplesDESeq             <- with(samples,data.frame(SampleName = I(SampleName), countf = I(countf)))
+samplesDESeq$Sample      <- as.factor(samples$SampleName)
+samplesDESeq$Project     <- as.factor(samples$Project)
+samplesDESeq$cell_line   <- as.factor(samples$Cell_line)
+samplesDESeq$Condition   <- factor(samples$Condition, levels = c("CTRL","AxD"))
+samplesDESeq$Cultivation <- factor(samples$Cultivation, levels = c("Aggrewell","Lancaster"))
+samplesDESeq$Timepoint   <- factor(samples$Timepoint, levels = c("D3","D5","D7","D9"))
+samplesDESeq$Replicate   <- as.factor(samples$Replicate)
+```
+
+Creates cds, object for DESeq analysis with second column specifying location of the count files. Shortens row names - ENSEMBLE ID to only first 18 characters. cds data filtered, so that genes with 0s in all samples are removed. Plot PCA (top 500 variable genes) from rlog data. dds will proceed to DESeq2 pipeline.
+```{r}
+cds <- DESeqDataSetFromHTSeqCount(samplesDESeq,directory="count/",design= ~ Condition) 
+
+keep <- rowSums(counts(cds)) >= 1
+dds <- cds[keep,]
+rld <- rlog(dds)
+
+saveRDS(rld,"rld.rds")
+#rld <- readRDS("rld.rds")
+
+saveRDS(dds,"dds.rds")
+#dds <- readRDS("dds.rds")
+
+data <- plotPCA(rld, intgroup = c("Condition","Timepoint","Cultivation"), returnData=TRUE,
+                ntop = 500)
+levels(data$Cultivation) <- c("Aggrewell","direct-seeding")
+
+percentVar <- round(100 * attr(data, "percentVar"))
+p <- qplot(PC1, PC2, color=Cultivation, shape=Timepoint, data=data) +
+  geom_point(size = 4) +
+  facet_grid(Condition ~.) +
+  scale_color_manual(values = c("direct-seeding" = "#5a9ac6", "Aggrewell" = "#fa5340")) +
+  scale_shape_manual(values = c(15,16,17,8), labels=c("d3","d5","d7","d9")) +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(linewidth = 0.7, color = "grey"),
+        axis.ticks = element_line(linewidth = 1, color = "grey"),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12),
+        legend.key.size = unit(0.7,units = "cm"), 
+        legend.spacing = unit(0,units = "cm"),
+        strip.text.y = element_text(size = 14, face = "bold", colour = "black"),
+        strip.background = element_rect(colour = "#b3b3b3", fill="#b3b3b3", linetype = "solid", linewidth = 3)) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  guides(shape = guide_legend(title = "Time Point"), 
+         color = guide_legend(title = "Cultivation", order = 2))
+p
+
+ggsave("PCA.png", plot = p, device = "png", bg = "white", width = 5, height = 4)
+ggsave("PCA_new.svg", plot = p, device = "svg", bg = "white", width = 5, height = 5)
+```
+
+DESeq, Filter up and downregulated genes - no NAs in fold change and padj, also baseMean higher than 10. When no gene symbol was mapped, copy ENSEMBL to symbol column.:
+```{r}
+timepoints <- c("D3","D5","D7","D9")
+condition <- c("CTRL","AxD")
+
+for (tp in timepoints){
+  for (c in condition){
+    dds.tp <- dds[,(dds$Timepoint %in% tp) & dds$Condition %in% c]
+    dds.tp$Condition <- as.factor(as.vector(dds.tp$Condition))
+    design(dds.tp) <- ~ Cultivation
+    dds.tp.DESeq <- DESeq(dds.tp) 
+    
+    saveRDS(dds.tp.DESeq,paste0("dds_",c,"_",tp,".rds"))
+    
+    res <- results(dds.tp.DESeq,contrast=c("Cultivation","Aggrewell","Lancaster"))
+    res$symbol <- mapIds(org.Hs.eg.db,keys=row.names(res),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+    
+    saveRDS(res, paste0("res_",c,"_",tp,".rds"))
+    write.csv(res,file = paste0("unfiltered_",c,"_",tp,".csv"))
+    
+    markers <- res[!is.na(res$log2FoldChange),]
+    markers <- markers[!is.na(markers$padj),]
+    markers <- markers[markers$baseMean >= 10,]
+    markers[order(markers$padj),]
+    genes <- as.data.frame(markers)
+    genes <- NA_replace(genes)
+      
+    saveRDS(genes, paste0("filtered_",c,"_",tp,".rds"))
+    write.csv(genes, paste0("filtered_",c,"_",tp,".csv"))
+  }
+}  
+```
+
+Barplot of DEGs, padj < 0.05, abs(log2FC) > 1 + numbers of DEGs at each time point into table, split to AxD and CTRL, DEGs between Lancaster and Aggrewell. First plot is AxD, second is CTRL, red is upregulated in Aggrewell compared to Lancaster, blue is downregulated in Aggrewell compared to Lancaster.
+```{r}
+padj <- 0.05
+# summarize numbers of DEGs, including shared ones, into a dataframe
+plot_list <- list()
+for (c in condition) {
+  df.numbers <- data.frame(UNC_up = c(),UNC_down = c())
+  counts <- c()
+  for (tp in timepoints) {
+    DEGs.UNC <- readRDS(paste0("filtered_",c,"_",tp,".rds"))
+  
+    up.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange > 1 & DEGs.UNC$padj < padj,])
+    down.UNC <- rownames(DEGs.UNC[DEGs.UNC$log2FoldChange < -1 & DEGs.UNC$padj < padj,])
+    
+    df.numbers <- rbind(df.numbers, c(length(up.UNC), length(down.UNC)))
+    counts <- append(counts, c(length(up.UNC), length(down.UNC)))
+  }
+    
+  colnames(df.numbers) <- c("UNC_up", "UNC_down")
+  rownames(df.numbers) <- timepoints
+  df.numbers
+  
+  # create barplot of DEGs
+  df <- data.frame(timepoints = rep(c("d3","d5","d7","d9"), each = 2),
+                     counts = counts, 
+                     set = rep(c("upregulated","downregulated"), times = 4))
+  df$set <- factor(df$set, levels = c("upregulated", "downregulated"))
+
+  p <- ggplot(data=df, aes(x=timepoints, y=counts, fill=set)) + 
+       geom_bar(stat="identity", position=position_dodge(), width = 0.8) + 
+       labs(x = "Time Points", fill = "Regulation", y = "Number of DEGs", title = c) +
+       scale_fill_manual(values=c("#fa5340", "#5a9ac6")) + 
+       #scale_y_continuous(expand = c(0, 0), limits = c(0, 1.1*max(df$counts))) +  
+       scale_y_continuous(expand = c(0, 0), limits = c(0, 1300)) +  
+       theme_classic()  + 
+       theme(axis.title = element_text(size=24), plot.title = element_text(size = 18, face = "bold"), 
+             legend.title = element_blank(), axis.line = element_line(colour = 'black', size = 0.5), 
+             axis.ticks.x = element_line(colour = "black", size = 3), axis.text.x = element_text(size = 24), 
+             axis.text.y = element_text(size = 24), legend.text = element_text(size = 20, vjust = 0.7),
+             legend.position = "bottom") + 
+       geom_text(aes(y=counts, label=counts), position = position_dodge(0.85), vjust=-0.5, color="black", size=7) 
+  plot_list[[c]] <- p 
+}
+
+gridExtra::grid.arrange(grobs = plot_list, ncol = 2)
+# 
+# #ggsave(filename = "barplotDEGs.png", plot = p, device = "png", height = 9, width = 8)
+ggsave(filename = "barplotDEGs.svg", plot = gridExtra::grid.arrange(grobs = plot_list, ncol = 2), device = "svg", height = 8, width = 12)
+```
+
+Overlapping and nonoverlapping DEgenes for each time point:
+```{r}
+venn_custom <- function(data, color, title){
+  ggvenn::ggvenn(data, fill_color = color, 
+                           stroke_size = 1, set_name_size = 6, show_percentage = F, text_size = 8) + 
+    ggtitle(title) +
+    theme(plot.title = element_text(size = 16, hjust = 0.5, vjust = 0, face = "bold")) +
+    scale_y_continuous(limits = c(-1, 1.5))
+}
+
+data_list <- list()
+plot_list <- list()
+setup <- c("UP","DOWN")
+
+for (s in setup){
+  for (tp in timepoints) {
+    if (s == "UP"){
+      degs.CTRL <- readRDS(paste0("filtered_CTRL_",tp,".rds")) %>% filter(log2FoldChange > 1 & padj < 0.05)
+      degs.AxD <- readRDS(paste0("filtered_AxD_",tp,".rds")) %>% filter(log2FoldChange > 1 & padj < 0.05)
+    } else if (s == "DOWN") {
+      degs.CTRL <- readRDS(paste0("filtered_CTRL_",tp,".rds")) %>% filter(log2FoldChange < -1 & padj < 0.05)
+      degs.AxD <- readRDS(paste0("filtered_AxD_",tp,".rds")) %>% filter(log2FoldChange < -1 & padj < 0.05)
+    }
+    data_list[[s]][[tp]][["CTRL"]] <- rownames(degs.CTRL)
+    data_list[[s]][[tp]][["AxD"]] <- rownames(degs.AxD)
+    
+    write(Reduce(intersect, data_list[[s]][[tp]]), file = paste0("overlaps/shared_",s,"_",tp,".txt"))
+    write(setdiff(data_list[[s]][[tp]][["CTRL"]],data_list[[s]][[tp]][["AxD"]]), 
+          file = paste0("overlaps/unique_CTRL_",s,"_",tp,".txt"))
+    write(setdiff(data_list[[s]][[tp]][["AxD"]],data_list[[s]][[tp]][["CTRL"]]),
+          file = paste0("overlaps/unique_AxD_",s,"_",tp,".txt"))
+    
+    if (s == "UP"){
+      plot_list[[s]][[tp]] <- venn_custom(data = data_list[[s]][[tp]], color = c("#fa5340","#fa5340"), title = tp)
+    } else if (s == "DOWN") {
+      plot_list[[s]][[tp]] <- venn_custom(data = data_list[[s]][[tp]], color = c("#5a9ac6","#5a9ac6"), title = tp)
+    }
+  }
+}
+
+ggsave("venn_UP.png", plot = gridExtra::grid.arrange(grobs = plot_list[["UP"]], nrow = 2), device = "png", width = 6, height = 6)
+ggsave("venn_DOWN.png", plot = gridExtra::grid.arrange(grobs = plot_list[["DOWN"]], nrow = 2), device = "png", width = 6, height = 6)
+```
+
+ORA
+Results are pooled - mixed BP, CC, MF, ordered by p.adj. Visualized are 5 top terms for each time point.
+```{r}
+timepoints <- c("D3","D5","D7","D9")
+cathegory <- c("shared_UP","shared_DOWN","unique_CTRL_UP","unique_CTRL_DOWN","unique_AxD_UP","unique_AxD_DOWN")
+background.file <- readRDS("dds.rds")
+background <- rownames(background.file)
+
+GOresults <- list()
+for (c in cathegory){
+  print(dir("overlaps/", pattern = c))
+  for (tp in timepoints){
+    print(tp)
+    skip <- FALSE
+    tryCatch(
+      {gene.list <- read.table(paste0("overlaps/",c,"_",tp,".txt"), header = F)[,1]
+      }, error = function(e){
+        print(paste(c, tp, "is an empty list, no ORA will be performed."))
+        skip <<- TRUE
+      }
+    )
+    
+    if (skip){
+      next
+    } else {
+    ego <- enrichGO(gene  = gene.list,
+              universe      = background,
+              keyType       = "ENSEMBL",
+              OrgDb         = org.Hs.eg.db,
+              ont           = "ALL",
+              pAdjustMethod = "fdr",
+              pvalueCutoff  = 0.1,
+              qvalueCutoff  = 0.2,
+              readable      = TRUE,
+              minGSSize     = 3)
+      print("ORA DONE..simplifying..saving")  
+      ego <- simplify(ego)
+      ego@result <- ego@result[order(ego@result$p.adjust),]
+      GOresults[[c]][[tp]] <- ego
+    }
+  }
+save(GOresults,file = paste0("ORA/overlaps.RData"))
+}
+```
+
+```{r}
+for (c in cathegory){
+  #GO.list <- lapply(GOresults[[c]], function(x) dropGO(x, term=filterGO(x@result)))
+  merged.GO <- merge_result(GOresults[[c]]) %>% pairwise_termsim()
+  merged.GO@compareClusterResult <- merged.GO@compareClusterResult[merged.GO@compareClusterResult$Count > 2,]
+  merged.GO@compareClusterResult$Description <- plyr::revalue(merged.GO@compareClusterResult$Description,c("oxidoreductase activity, acting on paired donors, with oxidation of a pair of donors resulting in the reduction of molecular oxygen to two molecules of water"="oxidoreductase activity*")) # for the sake of the plot, one of the labels was shortened
+  
+  q <- dotplot(merged.GO, by = "GeneRatio", showCategory = 5, includeAll = T, label_format = 50) + #, 
+               #split = "ONTOLOGY") +
+        theme_light() +
+       # facet_grid(ONTOLOGY~., scales = "free", space = "free_y") +
+        theme(axis.text = element_text(size = 16, colour = "black"),
+              axis.text.x = element_text(face = "bold"),
+              axis.title.x = element_blank(),
+              plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+              legend.text = element_text(size = 14),
+              legend.title = element_text(size = 14)) +#,
+             # strip.text.y = element_text(size = 14, face = "bold", colour = "black"),
+              #strip.background = element_rect(colour = "#b3b3b3", fill="#b3b3b3", linetype = "solid", 
+               #                               linewidth = 3)) +
+        scale_x_discrete(labels = timepoints)
+  if (grepl("UP", c)){
+    q <- q + scale_color_gradient(low = "#fa5340", high = "#fef2f0") + ggtitle(paste("Upregulated GO Terms",c)) 
+  } else {
+    q <- q + scale_color_gradient(low = "#5a9ac6", high = "#f2f7fa") + ggtitle(paste("Downregulated GO Terms",c)) +
+      labs(caption = "*oxidoreductase activity, acting on paired donors, with oxidation of a pair of donors resulting in the reduction of molecular oxygen to two molecules of water")
+  }
+  ggsave(paste0("ORA/overlaps_dotplots_",c,"_new.svg"), plot = q, device = "svg", width = 10, height = 7)
+}
+```
+
+# GEO files
+Generation of GEO normalized count files:
+```{r}
+setwd("Lancaster-Aggrewell/")
+# timepoints <- c("d3","d5","d7","d9")
+timepoints <- c("AxD_d3","AxD_d5","AxD_d7","AxD_d9","CTRL_d3","CTRL_d5","CTRL_d7","CTRL_d9")
+
+for (tp in timepoints){
+  dds <- readRDS(paste0("dds_",tp,".rds"))
+  counts <- counts(dds, normalized = T)
+  write.table(counts, paste0("GEO/geo_AxDorganoids_bulk_experiment2/ds-AW_counts_normalized_",tp,".txt"), sep = ",", row.names = T, col.names = T)
+}
+
+# MD5 checksums
+raw_files_path <- "GEO/geo_AxDorganoids_bulk_experiment2/"
+temp <- list.files(path = paste0(raw_files_path))
+length(temp) 
+  
+df <- data.frame(file = temp,
+                 md5 = NA)
+  
+# check the checksum
+for(name1 in 1:length(df$file)){
+  print(df$file[name1])
+  checksum <- NULL
+  checksum <- system(paste0("sha1sum ", raw_files_path,
+                     df$file[name1]),  intern = TRUE)
+  checksum <- gsub(pattern = " .*", replacement = "", x = checksum)
+  df$md5[name1] <- checksum
+}
+write.csv(x = df, file = "GEO/geo_AxDorganoids_bulk_experiment2/MD5.csv")
+```
