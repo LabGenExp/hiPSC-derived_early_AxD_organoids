@@ -3,13 +3,13 @@ This code was used to analyze bulk RNAseq from early brain organoid data in the 
 
 The contents of this repository are the following:
 
-_DESeq2_AxDorganoids.rmd_
+_DESeq2_AxDorganoids.rmd_ <br>
 R markdown file with the DESeq2 pipeline used for data analysis and generation of plots and files presented in the related manuscript.
 
-_exp1_commands.txt_ 
-_exp2_commands.txt_
-_exp1_2021_03_preprocessing_UMI_QuantSeq.R_
-_exp2_2021_03_preprocessing_UMI_QuantSeq.R_
+_exp1_commands.txt_ <br>
+_exp2_commands.txt_ <br>
+_exp1_2021_03_preprocessing_UMI_QuantSeq.R_ <br>
+_exp2_2021_03_preprocessing_UMI_QuantSeq.R_ <br>
 Commands used for preprocessing of the sequencing data from experiment 1 and 2.
 
 
